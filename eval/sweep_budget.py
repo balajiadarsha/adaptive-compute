@@ -1,9 +1,10 @@
 """
-Sweep token budgets for L1-Qwen-1.5B-Exact on UWNSL/SafeChain and evaluate
-with WildGuard to study the impact of reasoning budget on safety performance.
+Sweep token budgets for a reasoning model on UWNSL/SafeChain or
+allenai/wildguardmix (WildGuardTest) and evaluate with WildGuard to study the
+impact of reasoning budget on safety performance.
 
 Usage:
-    python sweep_budget.py [--n 500] [--budgets 256 512 1024 2048 4096] [--no-baseline]
+    python sweep_budget.py [--dataset safechain|wildguard] [--n 500] [--budgets 256 512 1024 2048 4096] [--no-baseline]
 """
 import argparse
 import json
@@ -31,12 +32,14 @@ def run(cmd: list[str], label: str):
         sys.exit(result.returncode)
 
 
-def generate_stage(budgets: list[int], n: int, max_tokens: int, seed: int, out_dir: str, baseline: bool):
+def generate_stage(budgets: list[int], n: int, max_tokens: int, seed: int, out_dir: str, baseline: bool, model_id: str, dataset: str):
     for budget in budgets:
         parquet = os.path.join(out_dir, f"gen_budget{budget}.parquet")
         run(
             [SCRIPT,
              "--generate",
+             "--dataset", dataset,
+             "--model-id", model_id,
              "--n", str(n),
              "--max-tokens", str(max_tokens),
              "--think-budget", str(budget),
@@ -50,6 +53,8 @@ def generate_stage(budgets: list[int], n: int, max_tokens: int, seed: int, out_d
         run(
             [SCRIPT,
              "--generate",
+             "--dataset", dataset,
+             "--model-id", model_id,
              "--n", str(n),
              "--max-tokens", str(max_tokens),
              "--parquet", parquet,
@@ -88,7 +93,7 @@ def evaluate_stage(budgets: list[int], out_dir: str, baseline: bool) -> list[str
     return result_files
 
 
-def summarize(result_files: list[tuple[str, str]], out_dir: str):
+def summarize(result_files: list[tuple[str, str]], out_dir: str, model_id: str, dataset: str):
     rows = []
     per_label_rows = []
 
@@ -149,7 +154,7 @@ def summarize(result_files: list[tuple[str, str]], out_dir: str):
     print(f"Excel saved to {excel_path}")
 
     # --- Plots ---
-    plot_path = _plot(df, df_per_label, out_dir)
+    plot_path = _plot(df, df_per_label, out_dir, model_id=model_id, dataset=dataset)
     print(f"Plots saved to {plot_path}")
 
     return df
@@ -163,7 +168,13 @@ def _numeric_budget(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _plot(df: pd.DataFrame, df_per_label: pd.DataFrame, out_dir: str) -> str:
+DATASET_LABEL = {
+    "safechain": "UWNSL/SafeChain",
+    "wildguard": "allenai/wildguardmix",
+}
+
+
+def _plot(df: pd.DataFrame, df_per_label: pd.DataFrame, out_dir: str, model_id: str, dataset: str) -> str:
     df = _numeric_budget(df)
     x_labels = df["budget"].tolist()
     x = range(len(x_labels))
@@ -176,9 +187,12 @@ def _plot(df: pd.DataFrame, df_per_label: pd.DataFrame, out_dir: str) -> str:
         "adversarial_benign": "#2ca02c",
     }
 
+    dataset_label = DATASET_LABEL.get(dataset, dataset)
+    model_slug = model_id.split("/")[-1]
+
     fig, axes = plt.subplots(3, 2, figsize=(14, 15))
     fig.suptitle(
-        "Impact of Reasoning Token Budget on Safety\n(L1-Qwen-1.5B-Exact · UWNSL/SafeChain · WildGuard)",
+        f"Impact of Reasoning Token Budget on Safety\n({model_slug} · {dataset_label} · WildGuard)",
         fontsize=13, fontweight="bold", y=1.01,
     )
 
@@ -255,11 +269,14 @@ def _plot(df: pd.DataFrame, df_per_label: pd.DataFrame, out_dir: str) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Token budget sweep for L1 + WildGuard")
+    parser = argparse.ArgumentParser(description="Token budget sweep for a reasoning model + WildGuard")
+    parser.add_argument("--dataset", type=str, default="safechain", choices=("safechain", "wildguard"),
+                        help="Dataset to sweep on: 'safechain' (UWNSL/SafeChain) or "
+                             "'wildguard' (allenai/wildguardmix, wildguardtest split). Default: safechain")
     parser.add_argument("--budgets", type=int, nargs="+", default=[256, 512, 1024, 2048, 4096],
                         help="List of token budgets to sweep (default: 256 512 1024 2048 4096)")
     parser.add_argument("--n", type=int, default=500,
-                        help="Number of WildGuardMix samples per run (default: 500)")
+                        help="Number of dataset samples per run (default: 500)")
     parser.add_argument("--max-tokens", type=int, default=8192,
                         help="Max generation tokens (should be >= largest budget, default: 8192)")
     parser.add_argument("--seed", type=int, default=42,
@@ -270,11 +287,15 @@ def main():
                         help="Directory to save parquets and results (default: sweep_<timestamp>/)")
     parser.add_argument("--evaluate-only", action="store_true",
                         help="Skip generation, only run WildGuard on existing parquets in --out-dir")
+    parser.add_argument("--model-id", type=str, default="l3lab/L1-Qwen-1.5B-Exact",
+                        help="HuggingFace model ID to evaluate (default: l3lab/L1-Qwen-1.5B-Exact)")
     args = parser.parse_args()
 
     out_dir = args.out_dir or f"sweep_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     os.makedirs(out_dir, exist_ok=True)
     print(f"Output directory: {out_dir}")
+    print(f"Model: {args.model_id}")
+    print(f"Dataset: {args.dataset}")
     print(f"Budgets: {args.budgets}")
     print(f"Samples per run: {args.n}")
     print(f"Baseline: {not args.no_baseline}")
@@ -287,6 +308,8 @@ def main():
             seed=args.seed,
             out_dir=out_dir,
             baseline=not args.no_baseline,
+            model_id=args.model_id,
+            dataset=args.dataset,
         )
 
     result_files = evaluate_stage(
@@ -295,7 +318,7 @@ def main():
         baseline=not args.no_baseline,
     )
 
-    summarize(result_files, out_dir)
+    summarize(result_files, out_dir, model_id=args.model_id, dataset=args.dataset)
 
 
 if __name__ == "__main__":

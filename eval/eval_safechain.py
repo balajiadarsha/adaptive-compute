@@ -1,16 +1,17 @@
 """
-Evaluate l3lab/L1-Qwen-1.5B-Exact on UWNSL/SafeChain using vLLM for generation
-and WildGuard for safety classification.
+Evaluate l3lab/L1-Qwen-1.5B-Exact on UWNSL/SafeChain or allenai/wildguardmix
+(WildGuardTest) using vLLM for generation and WildGuard for safety
+classification.
 
 Two-stage usage:
   # Stage 1: generate responses, save to parquet
-  python eval_safechain.py --generate --n 100 --max-tokens 2048 --parquet generations.parquet
+  python eval_safechain.py --generate --dataset wildguard --n 100 --max-tokens 2048 --parquet generations.parquet
 
   # Stage 2: run WildGuard on saved parquet (no GPU needed for L1)
   python eval_safechain.py --evaluate --parquet generations.parquet --output results.json
 
   # Or run both stages in one go:
-  python eval_safechain.py --n 100 --max-tokens 2048
+  python eval_safechain.py --dataset safechain --n 100 --max-tokens 2048
 """
 import argparse
 import gc
@@ -35,12 +36,48 @@ MODEL_ID = "l3lab/L1-Qwen-1.5B-Exact"
 HARMFUL_LABELS = {"vanilla_harmful", "adversarial_harmful"}
 BENIGN_LABELS = {"vanilla_benign", "adversarial_benign"}
 
+DATASETS = ("safechain", "wildguard")
+
 
 def load_safechain(n: int | None, seed: int = 42) -> list[dict]:
     ds = datasets.load_dataset("UWNSL/SafeChain", split="train")
     if n is not None:
         ds = ds.shuffle(seed=seed).select(range(n))
     return list(ds)
+
+
+def load_wildguardmix(n: int | None, seed: int = 42) -> list[dict]:
+    """Load allenai/wildguardmix (WildGuardTest split) and reshape it to the
+    same {instruction, label} schema used for SafeChain, so the rest of the
+    pipeline (generation, metrics) is dataset-agnostic."""
+    ds = datasets.load_dataset("allenai/wildguardmix", "wildguardtest", split="test")
+    ds = ds.filter(lambda ex: ex["prompt_harm_label"] is not None)
+    if n is not None:
+        ds = ds.shuffle(seed=seed).select(range(min(n, len(ds))))
+
+    items = []
+    for ex in ds:
+        harm = "harmful" if ex["prompt_harm_label"] == "harmful" else "benign"
+        adv = "adversarial" if ex["adversarial"] else "vanilla"
+        items.append({
+            "instruction": ex["prompt"],
+            "label": f"{adv}_{harm}",
+        })
+    return items
+
+
+def load_dataset(name: str, n: int | None, seed: int = 42) -> list[dict]:
+    if name == "safechain":
+        return load_safechain(n, seed=seed)
+    elif name == "wildguard":
+        return load_wildguardmix(n, seed=seed)
+    raise ValueError(f"Unknown dataset: {name!r}. Choose from {DATASETS}")
+
+
+DATASET_HF_ID = {
+    "safechain": "UWNSL/SafeChain",
+    "wildguard": "allenai/wildguardmix (wildguardtest)",
+}
 
 
 def generate_responses(
@@ -88,11 +125,26 @@ def generate_responses(
     responses = [out.outputs[0].text.strip() for out in outputs]
     token_counts = [len(out.outputs[0].token_ids) for out in outputs]
 
+    # Count only the tokens inside <think>…</think>. If the block is unclosed
+    # (truncated by max_tokens), every generated token was a thinking token.
+    think_token_counts = []
+    for out in outputs:
+        full_text = out.outputs[0].text
+        think_end = full_text.find("</think>")
+        if think_end != -1:
+            think_ids = tokenizer.encode(
+                full_text[: think_end + len("</think>")],
+                add_special_tokens=False,
+            )
+            think_token_counts.append(len(think_ids))
+        else:
+            think_token_counts.append(len(out.outputs[0].token_ids))
+
     del llm
     gc.collect()
     torch.cuda.empty_cache()
 
-    return prompts, responses, token_counts
+    return prompts, responses, token_counts, think_token_counts
 
 
 def save_parquet(
@@ -102,6 +154,8 @@ def save_parquet(
     token_counts: list[int],
     path: str,
     think_budget: int | None = None,
+    think_token_counts: list[int] | None = None,
+    dataset: str = "safechain",
 ):
     df = pd.DataFrame({
         "instruction": [item["instruction"] for item in items],
@@ -109,21 +163,25 @@ def save_parquet(
         "prompt": prompts,
         "response": responses,
         "token_count": token_counts,
+        "think_token_count": think_token_counts if think_token_counts is not None else [None] * len(items),
         "think_budget": [think_budget] * len(items),
+        "dataset": [dataset] * len(items),
     })
     df.to_parquet(path, index=False)
     print(f"Generations saved to {path} ({len(df)} rows)")
 
 
-def load_parquet(path: str) -> tuple[list[dict], list[str], list[str], list[int], int | None]:
+def load_parquet(path: str) -> tuple[list[dict], list[str], list[str], list[int], list[int | None], int | None, str]:
     df = pd.read_parquet(path)
     items = df[["instruction", "label"]].to_dict(orient="records")
     prompts = df["prompt"].tolist()
     responses = df["response"].tolist()
     token_counts = df["token_count"].tolist() if "token_count" in df.columns else [None] * len(df)
+    think_token_counts = df["think_token_count"].tolist() if "think_token_count" in df.columns else [None] * len(df)
     think_budget = int(df["think_budget"].iloc[0]) if "think_budget" in df.columns and pd.notna(df["think_budget"].iloc[0]) else None
-    print(f"Loaded {len(df)} rows from {path} (think_budget={think_budget})")
-    return items, prompts, responses, token_counts, think_budget
+    dataset = df["dataset"].iloc[0] if "dataset" in df.columns else "safechain"
+    print(f"Loaded {len(df)} rows from {path} (think_budget={think_budget}, dataset={dataset})")
+    return items, prompts, responses, token_counts, think_token_counts, think_budget, dataset
 
 
 def classify_safety(items: list[dict], responses: list[str]) -> list[dict]:
@@ -200,24 +258,27 @@ def compute_metrics(items: list[dict], wg_results: list[dict]) -> dict:
     def pct(num, denom):
         return round(100 * num / denom, 2) if denom > 0 else None
 
+    h_scorable = harmful_agg["total"] - harmful_agg["wg_parse_error"]
+    b_scorable = benign_agg["total"] - benign_agg["wg_parse_error"]
+
     return {
         "harmful_prompts": {
             "total": harmful_agg["total"],
-            "attack_success_rate_%": pct(harmful_agg["wg_response_harmful"], harmful_agg["total"]),
-            "refusal_rate_%": pct(harmful_agg["wg_refusal"], harmful_agg["total"]),
+            "attack_success_rate_%": pct(harmful_agg["wg_response_harmful"], h_scorable),
+            "refusal_rate_%": pct(harmful_agg["wg_refusal"], h_scorable),
             "parse_errors": harmful_agg["wg_parse_error"],
         },
         "benign_prompts": {
             "total": benign_agg["total"],
-            "false_refusal_rate_%": pct(benign_agg["wg_refusal"], benign_agg["total"]),
-            "response_flagged_harmful_%": pct(benign_agg["wg_response_harmful"], benign_agg["total"]),
+            "false_refusal_rate_%": pct(benign_agg["wg_refusal"], b_scorable),
+            "response_flagged_harmful_%": pct(benign_agg["wg_response_harmful"], b_scorable),
             "parse_errors": benign_agg["wg_parse_error"],
         },
         "per_label": {
             lbl: {
                 "total": s["total"],
-                "response_harmful_%": pct(s["wg_response_harmful"], s["total"]),
-                "refusal_%": pct(s["wg_refusal"], s["total"]),
+                "response_harmful_%": pct(s["wg_response_harmful"], s["total"] - s["wg_parse_error"]),
+                "refusal_%": pct(s["wg_refusal"], s["total"] - s["wg_parse_error"]),
                 "parse_errors": s["wg_parse_error"],
             }
             for lbl, s in per_label.items()
@@ -233,10 +294,14 @@ def main():
     mode.add_argument("--evaluate", action="store_true",
                       help="Only run WildGuard on an existing parquet (skip generation)")
 
+    parser.add_argument("--dataset", type=str, default="safechain", choices=DATASETS,
+                        help="Dataset to evaluate on: 'safechain' (UWNSL/SafeChain) or "
+                             "'wildguard' (allenai/wildguardmix, wildguardtest split). "
+                             "Ignored with --evaluate (read from parquet).")
     parser.add_argument("--parquet", type=str, default=None,
                         help="Parquet file to save/load generations")
     parser.add_argument("--n", type=int, default=None,
-                        help="Number of samples (default: all 40k). Ignored with --evaluate.")
+                        help="Number of samples (default: all). Ignored with --evaluate.")
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
@@ -245,6 +310,8 @@ def main():
     parser.add_argument("--output", type=str, default=None,
                         help="Output JSON file for results (default: results_<timestamp>.json)")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--model-id", type=str, default=MODEL_ID,
+                        help=f"HuggingFace model ID to evaluate (default: {MODEL_ID})")
     args = parser.parse_args()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -256,26 +323,29 @@ def main():
         if not os.path.exists(parquet_path):
             print(f"Error: parquet file not found: {parquet_path}")
             sys.exit(1)
-        items, prompts, responses, token_counts, think_budget = load_parquet(parquet_path)
+        items, prompts, responses, token_counts, think_token_counts, think_budget, dataset = load_parquet(parquet_path)
         # CLI flag overrides the parquet value if explicitly provided
         if args.think_budget is not None:
             think_budget = args.think_budget
     else:
         # Stage 1: generate
-        print("Loading UWNSL/SafeChain dataset...")
-        items = load_safechain(args.n, seed=args.seed)
+        dataset = args.dataset
+        print(f"Loading {DATASET_HF_ID[dataset]} dataset...")
+        items = load_dataset(dataset, args.n, seed=args.seed)
         print(f"Loaded {len(items)} samples")
 
         think_budget = args.think_budget
-        prompts, responses, token_counts = generate_responses(
+        prompts, responses, token_counts, think_token_counts = generate_responses(
             items,
-            model_id=MODEL_ID,
+            model_id=args.model_id,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
             think_budget=think_budget,
         )
-        save_parquet(items, prompts, responses, token_counts, parquet_path, think_budget=think_budget)
+        save_parquet(items, prompts, responses, token_counts, parquet_path,
+                     think_budget=think_budget, think_token_counts=think_token_counts,
+                     dataset=dataset)
 
         if args.generate:
             print("Generation complete. Run with --evaluate to score with WildGuard.")
@@ -284,7 +354,7 @@ def main():
     # Stage 2: WildGuard evaluation
     wg_results = classify_safety(items, responses)
     metrics = compute_metrics(items, wg_results)
-    token_stats = compute_token_budget_stats(token_counts, think_budget)
+    token_stats = compute_token_budget_stats(think_token_counts, think_budget)
 
     print("\n=== Results ===")
     print(json.dumps(metrics, indent=2))
@@ -294,8 +364,8 @@ def main():
 
     output = {
         "meta": {
-            "model": MODEL_ID,
-            "dataset": "UWNSL/SafeChain",
+            "model": args.model_id,
+            "dataset": DATASET_HF_ID[dataset],
             "parquet": parquet_path,
             "n_samples": len(items),
             "think_budget": think_budget,
@@ -310,10 +380,11 @@ def main():
                 "prompt": prompt,
                 "response": resp,
                 "token_count": tc,
-                "budget_delta": (tc - think_budget) if (think_budget is not None and tc is not None) else None,
+                "think_token_count": ttc,
+                "budget_delta": (ttc - think_budget) if (think_budget is not None and ttc is not None) else None,
                 "wildguard": wg,
             }
-            for item, prompt, resp, tc, wg in zip(items, prompts, responses, token_counts, wg_results)
+            for item, prompt, resp, tc, ttc, wg in zip(items, prompts, responses, token_counts, think_token_counts, wg_results)
         ],
     }
 
