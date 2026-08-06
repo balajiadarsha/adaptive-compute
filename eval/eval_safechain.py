@@ -27,7 +27,7 @@ import torch
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "wildguard"))
+#sys.path.insert(0, os.path.join(os.path.dirname(__file__), "wildguard"))
 from wildguard import load_wildguard
 
 

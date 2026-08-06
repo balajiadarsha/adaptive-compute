@@ -7,4 +7,3 @@ matplotlib
 numpy
 openpyxl
 tqdm
-wildguard @ file:///../wildguard
