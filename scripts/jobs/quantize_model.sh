@@ -12,7 +12,7 @@ set -euo pipefail
 PROJ_DIR="/home/abalaji/projects/reasoning/safety-eval"
 MODEL_ID="l3lab/L1-Qwen-1.5B-Exact"
 MODEL_SLUG="L1-Qwen-1.5B-Exact"
-CKPT_DIR="/lus/eagle/projects/argonne_tpc/abalaji/adaptive/checkpoints/${MODEL_SLUG}"
+CKPT_DIR="/lus/flare/projects/ModCon/abalaji/adaptive/models/${MODEL_SLUG}"
 
 mkdir -p "${CKPT_DIR}"
 
@@ -26,8 +26,8 @@ ml use /soft/modulefiles
 ml --ignore_cache load cudatoolkit-standalone/12.6.1
 
 # --- Conda ---
-ml --ignore_cache load conda
-conda activate /lus/eagle/projects/argonne_tpc/abalaji/conda_env/safety_eval
+#ml --ignore_cache load conda
+#conda activate /lus/eagle/projects/argonne_tpc/abalaji/conda_env/safety_eval
 
 # --- Proxy ---
 export HTTP_PROXY="http://proxy.alcf.anl.gov:3128"
