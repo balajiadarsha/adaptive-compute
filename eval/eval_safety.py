@@ -21,7 +21,6 @@ import sys
 from collections import defaultdict
 from datetime import datetime
 
-import datasets
 import pandas as pd
 import torch
 from vllm import LLM, SamplingParams
@@ -30,54 +29,14 @@ from transformers import AutoTokenizer
 #sys.path.insert(0, os.path.join(os.path.dirname(__file__), "wildguard"))
 from wildguard import load_wildguard
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "utils"))
+from dataset_utils import DATASETS, DATASET_HF_ID, load_dataset, load_safechain, load_wildguardmix  # noqa: E402
+
 
 MODEL_ID = "l3lab/L1-Qwen-1.5B-Exact"
 
 HARMFUL_LABELS = {"vanilla_harmful", "adversarial_harmful"}
 BENIGN_LABELS = {"vanilla_benign", "adversarial_benign"}
-
-DATASETS = ("safechain", "wildguard")
-
-
-def load_safechain(n: int | None, seed: int = 42) -> list[dict]:
-    ds = datasets.load_dataset("UWNSL/SafeChain", split="train")
-    if n is not None:
-        ds = ds.shuffle(seed=seed).select(range(n))
-    return list(ds)
-
-
-def load_wildguardmix(n: int | None, seed: int = 42) -> list[dict]:
-    """Load allenai/wildguardmix (WildGuardTest split) and reshape it to the
-    same {instruction, label} schema used for SafeChain, so the rest of the
-    pipeline (generation, metrics) is dataset-agnostic."""
-    ds = datasets.load_dataset("allenai/wildguardmix", "wildguardtest", split="test")
-    ds = ds.filter(lambda ex: ex["prompt_harm_label"] is not None)
-    if n is not None:
-        ds = ds.shuffle(seed=seed).select(range(min(n, len(ds))))
-
-    items = []
-    for ex in ds:
-        harm = "harmful" if ex["prompt_harm_label"] == "harmful" else "benign"
-        adv = "adversarial" if ex["adversarial"] else "vanilla"
-        items.append({
-            "instruction": ex["prompt"],
-            "label": f"{adv}_{harm}",
-        })
-    return items
-
-
-def load_dataset(name: str, n: int | None, seed: int = 42) -> list[dict]:
-    if name == "safechain":
-        return load_safechain(n, seed=seed)
-    elif name == "wildguard":
-        return load_wildguardmix(n, seed=seed)
-    raise ValueError(f"Unknown dataset: {name!r}. Choose from {DATASETS}")
-
-
-DATASET_HF_ID = {
-    "safechain": "UWNSL/SafeChain",
-    "wildguard": "allenai/wildguardmix (wildguardtest)",
-}
 
 
 def generate_responses(

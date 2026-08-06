@@ -42,8 +42,8 @@ from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.transform.smoothquant import SmoothQuantModifier
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "eval"))
-from eval_safety import DATASETS, load_dataset  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "utils"))
+from dataset_utils import DATASETS, load_dataset  # noqa: E402
 
 SCHEMES = ("W8A8", "W4A8")
 

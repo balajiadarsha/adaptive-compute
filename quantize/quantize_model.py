@@ -26,8 +26,8 @@ import sys
 from gptqmodel import GPTQModel, QuantizeConfig
 from transformers import AutoTokenizer
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "eval"))
-from eval_safety import DATASETS, load_dataset  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "utils"))
+from dataset_utils import DATASETS, load_dataset  # noqa: E402
 
 BITS = (8, 4, 3)
 
