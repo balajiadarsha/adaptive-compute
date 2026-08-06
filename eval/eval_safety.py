@@ -289,6 +289,11 @@ def compute_metrics(items: list[dict], wg_results: list[dict]) -> dict:
 def main():
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group()
+    
+    # Operation modes:
+    #   generate: run generation and save to parquet, skip WildGuard evaluation
+    #   evaluate: run WildGuard evaluation on existing parquet, skip generation
+
     mode.add_argument("--generate", action="store_true",
                       help="Only run generation, save parquet, skip WildGuard")
     mode.add_argument("--evaluate", action="store_true",
