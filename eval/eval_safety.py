@@ -24,6 +24,7 @@ from datetime import datetime
 import datasets
 import pandas as pd
 import torch
+import torch.multiprocessing as mp
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
@@ -80,25 +81,7 @@ DATASET_HF_ID = {
 }
 
 
-def generate_responses(
-    items: list[dict],
-    model_id: str,
-    max_tokens: int,
-    temperature: float,
-    top_p: float,
-    think_budget: int | None = None,
-) -> tuple[list[str], list[str], list[int]]:
-    print(f"\nLoading {model_id} with vLLM...")
-    if think_budget is not None:
-        print(f"Token budget: {think_budget} tokens")
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=False)
-    llm = LLM(
-        model=model_id,
-        trust_remote_code=True,
-        gpu_memory_utilization=0.45,
-        max_model_len=32768,
-    )
-
+def _build_prompts(items: list[dict], tokenizer, think_budget: int | None) -> list[str]:
     prompts = []
     for item in items:
         instruction = item["instruction"]
@@ -112,19 +95,10 @@ def generate_responses(
         else:
             text = f"## Instruction: {instruction}\n## Response: "
         prompts.append(text)
+    return prompts
 
-    sampling_params = SamplingParams(
-        temperature=temperature,
-        top_p=top_p,
-        max_tokens=max_tokens,
-        stop_token_ids=[tokenizer.eos_token_id] if tokenizer.eos_token_id else None,
-    )
 
-    print(f"Generating responses for {len(prompts)} prompts...")
-    outputs = llm.generate(prompts, sampling_params=sampling_params)
-    responses = [out.outputs[0].text.strip() for out in outputs]
-    token_counts = [len(out.outputs[0].token_ids) for out in outputs]
-
+def _think_token_counts(outputs, tokenizer) -> list[int]:
     # Count only the tokens inside <think>…</think>. If the block is unclosed
     # (truncated by max_tokens), every generated token was a thinking token.
     think_token_counts = []
@@ -139,10 +113,143 @@ def generate_responses(
             think_token_counts.append(len(think_ids))
         else:
             think_token_counts.append(len(out.outputs[0].token_ids))
+    return think_token_counts
+
+
+def generate_responses(
+    items: list[dict],
+    model_id: str,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    think_budget: int | None = None,
+    tensor_parallel_size: int = 4,
+) -> tuple[list[str], list[str], list[int], list[int]]:
+    print(f"\nLoading {model_id} with vLLM (tensor_parallel_size={tensor_parallel_size})...")
+    if think_budget is not None:
+        print(f"Token budget: {think_budget} tokens")
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=True)
+    llm = LLM(
+        model=model_id,
+        trust_remote_code=True,
+        gpu_memory_utilization=0.45,
+        max_model_len=32768,
+        tensor_parallel_size=tensor_parallel_size,
+    )
+
+    prompts = _build_prompts(items, tokenizer, think_budget)
+
+    sampling_params = SamplingParams(
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        stop_token_ids=[tokenizer.eos_token_id] if tokenizer.eos_token_id else None,
+    )
+
+    print(f"Generating responses for {len(prompts)} prompts...")
+    outputs = llm.generate(prompts, sampling_params=sampling_params)
+    responses = [out.outputs[0].text.strip() for out in outputs]
+    token_counts = [len(out.outputs[0].token_ids) for out in outputs]
+    think_token_counts = _think_token_counts(outputs, tokenizer)
 
     del llm
     gc.collect()
     torch.cuda.empty_cache()
+
+    return prompts, responses, token_counts, think_token_counts
+
+
+def _dp_worker(
+    rank: int,
+    gpu_ids: list[str],
+    items: list[dict],
+    model_id: str,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    think_budget: int | None,
+    tensor_parallel_size: int,
+    result_queue,
+):
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
+    print(f"[dp-worker {rank}] GPUs={gpu_ids} items={len(items)}")
+    prompts, responses, token_counts, think_token_counts = generate_responses(
+        items,
+        model_id=model_id,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        think_budget=think_budget,
+        tensor_parallel_size=tensor_parallel_size,
+    )
+    result_queue.put((rank, prompts, responses, token_counts, think_token_counts))
+
+
+def generate_responses_data_parallel(
+    items: list[dict],
+    model_id: str,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    num_dp_workers: int,
+    tensor_parallel_size: int = 1,
+    think_budget: int | None = None,
+) -> tuple[list[str], list[str], list[int], list[int]]:
+    """Run `num_dp_workers` independent vLLM engines in parallel, each pinned
+    to its own slice of `tensor_parallel_size` GPUs, sharding `items` across
+    them. Requires num_dp_workers * tensor_parallel_size GPUs on the node."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    all_gpu_ids = visible.split(",") if visible else [str(i) for i in range(torch.cuda.device_count())]
+    needed = num_dp_workers * tensor_parallel_size
+    if needed > len(all_gpu_ids):
+        raise ValueError(
+            f"num_dp_workers ({num_dp_workers}) * tensor_parallel_size ({tensor_parallel_size}) "
+            f"= {needed} exceeds available GPUs ({len(all_gpu_ids)}: {all_gpu_ids})"
+        )
+
+    # Round-robin shard so each worker gets a representative slice of the
+    # dataset (matters if items are ordered by label/category).
+    shards: list[list[dict]] = [[] for _ in range(num_dp_workers)]
+    shard_indices: list[list[int]] = [[] for _ in range(num_dp_workers)]
+    for i, item in enumerate(items):
+        w = i % num_dp_workers
+        shards[w].append(item)
+        shard_indices[w].append(i)
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    procs = []
+    for rank in range(num_dp_workers):
+        gpu_ids = all_gpu_ids[rank * tensor_parallel_size:(rank + 1) * tensor_parallel_size]
+        p = ctx.Process(
+            target=_dp_worker,
+            args=(rank, gpu_ids, shards[rank], model_id, max_tokens, temperature,
+                  top_p, think_budget, tensor_parallel_size, result_queue),
+        )
+        p.start()
+        procs.append(p)
+
+    results_by_rank = {}
+    for _ in procs:
+        rank, prompts, responses, token_counts, think_token_counts = result_queue.get()
+        results_by_rank[rank] = (prompts, responses, token_counts, think_token_counts)
+    for p in procs:
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(f"DP worker exited with code {p.exitcode}")
+
+    # Reassemble in original item order.
+    n = len(items)
+    prompts: list[str | None] = [None] * n
+    responses: list[str | None] = [None] * n
+    token_counts: list[int | None] = [None] * n
+    think_token_counts: list[int | None] = [None] * n
+    for rank, (p_, r_, tc_, ttc_) in results_by_rank.items():
+        for local_i, orig_i in enumerate(shard_indices[rank]):
+            prompts[orig_i] = p_[local_i]
+            responses[orig_i] = r_[local_i]
+            token_counts[orig_i] = tc_[local_i]
+            think_token_counts[orig_i] = ttc_[local_i]
 
     return prompts, responses, token_counts, think_token_counts
 
@@ -317,6 +424,13 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model-id", type=str, default=MODEL_ID,
                         help=f"HuggingFace model ID to evaluate (default: {MODEL_ID})")
+    parser.add_argument("--tensor-parallel-size", type=int, default=4,
+                        help="GPUs per model replica (vLLM tensor parallelism). Default: 4.")
+    parser.add_argument("--num-dp-workers", type=int, default=1,
+                        help="Number of data-parallel model replicas, each using "
+                             "--tensor-parallel-size GPUs, sharding the dataset across "
+                             "them. Requires num-dp-workers * tensor-parallel-size GPUs. "
+                             "Default: 1 (no data parallelism).")
     args = parser.parse_args()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -340,14 +454,27 @@ def main():
         print(f"Loaded {len(items)} samples")
 
         think_budget = args.think_budget
-        prompts, responses, token_counts, think_token_counts = generate_responses(
-            items,
-            model_id=args.model_id,
-            max_tokens=args.max_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            think_budget=think_budget,
-        )
+        if args.num_dp_workers > 1:
+            prompts, responses, token_counts, think_token_counts = generate_responses_data_parallel(
+                items,
+                model_id=args.model_id,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                num_dp_workers=args.num_dp_workers,
+                tensor_parallel_size=args.tensor_parallel_size,
+                think_budget=think_budget,
+            )
+        else:
+            prompts, responses, token_counts, think_token_counts = generate_responses(
+                items,
+                model_id=args.model_id,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                think_budget=think_budget,
+                tensor_parallel_size=args.tensor_parallel_size,
+            )
         save_parquet(items, prompts, responses, token_counts, parquet_path,
                      think_budget=think_budget, think_token_counts=think_token_counts,
                      dataset=dataset)

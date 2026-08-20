@@ -18,7 +18,7 @@ import matplotlib.ticker as mticker
 import pandas as pd
 
 
-SCRIPT = os.path.join(os.path.dirname(__file__), "eval_safechain.py")
+SCRIPT = os.path.join(os.path.dirname(__file__), "eval_safety.py")
 
 
 def run(cmd: list[str], label: str):
@@ -32,7 +32,7 @@ def run(cmd: list[str], label: str):
         sys.exit(result.returncode)
 
 
-def generate_stage(budgets: list[int], n: int, max_tokens: int, seed: int, out_dir: str, baseline: bool, model_id: str, dataset: str):
+def generate_stage(budgets: list[int], n: int, max_tokens: int, seed: int, out_dir: str, baseline: bool, model_id: str, dataset: str, tensor_parallel_size: int, num_dp_workers: int):
     for budget in budgets:
         parquet = os.path.join(out_dir, f"gen_budget{budget}.parquet")
         run(
@@ -44,7 +44,9 @@ def generate_stage(budgets: list[int], n: int, max_tokens: int, seed: int, out_d
              "--max-tokens", str(max_tokens),
              "--think-budget", str(budget),
              "--parquet", parquet,
-             "--seed", str(seed)],
+             "--seed", str(seed),
+             "--tensor-parallel-size", str(tensor_parallel_size),
+             "--num-dp-workers", str(num_dp_workers)],
             f"Generate | budget={budget} tokens | n={n}",
         )
 
@@ -58,7 +60,9 @@ def generate_stage(budgets: list[int], n: int, max_tokens: int, seed: int, out_d
              "--n", str(n),
              "--max-tokens", str(max_tokens),
              "--parquet", parquet,
-             "--seed", str(seed)],
+             "--seed", str(seed),
+             "--tensor-parallel-size", str(tensor_parallel_size),
+             "--num-dp-workers", str(num_dp_workers)],
             f"Generate | no budget (baseline) | n={n}",
         )
 
@@ -289,6 +293,11 @@ def main():
                         help="Skip generation, only run WildGuard on existing parquets in --out-dir")
     parser.add_argument("--model-id", type=str, default="l3lab/L1-Qwen-1.5B-Exact",
                         help="HuggingFace model ID to evaluate (default: l3lab/L1-Qwen-1.5B-Exact)")
+    parser.add_argument("--tensor-parallel-size", type=int, default=4,
+                        help="GPUs per model replica (vLLM tensor parallelism). Default: 4.")
+    parser.add_argument("--num-dp-workers", type=int, default=1,
+                        help="Number of data-parallel model replicas, each using "
+                             "--tensor-parallel-size GPUs. Default: 1 (no data parallelism).")
     args = parser.parse_args()
 
     out_dir = args.out_dir or f"sweep_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -310,6 +319,8 @@ def main():
             baseline=not args.no_baseline,
             model_id=args.model_id,
             dataset=args.dataset,
+            tensor_parallel_size=args.tensor_parallel_size,
+            num_dp_workers=args.num_dp_workers,
         )
 
     result_files = evaluate_stage(

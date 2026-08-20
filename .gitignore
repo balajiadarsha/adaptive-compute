@@ -2,3 +2,8 @@
 *.csv
 *.o*
 __pycache__/
+*.png
+*.json
+*.parquet
+checkpoints/
+*.log

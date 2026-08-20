@@ -10,8 +10,8 @@
 set -euo pipefail
 
 PROJ_DIR="/home/abalaji/projects/reasoning/safety-eval"
-MODEL_ID="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-MODEL_SLUG="DeepSeek-R1-Distill-Qwen-1.5B"
+MODEL_ID="/lus/eagle/projects/argonne_tpc/abalaji/agpt/models/quantized/global_step138650"
+MODEL_SLUG="Aurora-GPT-2B"
 OUTPUT_DIR="/lus/eagle/projects/argonne_tpc/abalaji/adaptive/output/${MODEL_SLUG}"
 
 mkdir -p "${OUTPUT_DIR}"
@@ -52,9 +52,9 @@ export HOST_IP=${VLLM_HOST_IP}
 cd "${PROJ_DIR}/adaptive-compute/eval"
 
 python sweep_budget.py \
-  --model-id "${MODEL_ID}" \
+  --model-id /lus/eagle/projects/argonne_tpc/abalaji/agpt/models/quantized/global_step138650 \
   --budgets 512 1024 2048 3600 \
-  --n 500 \
+  --n 5000 \
   --max-tokens 8192 \
   --seed 42 \
   --out-dir "${OUTPUT_DIR}"
