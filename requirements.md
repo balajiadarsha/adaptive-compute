@@ -7,7 +7,6 @@ matplotlib
 numpy
 openpyxl
 tqdm
-wildguard @ file:///../wildguard
 gptqmodel>=7.3.2
 llmcompressor>=0.12.0
 compressed-tensors>=0.17.1
