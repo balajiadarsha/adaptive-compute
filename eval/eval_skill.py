@@ -45,6 +45,33 @@ DATASET_HF_ID = {
 LETTERS = "ABCDEFGH"
 
 
+def _flashinfer_comm_broken() -> bool:
+    """vLLM's torch.compile backend init imports flashinfer.comm; on this
+    cluster's flashinfer build that import raises
+    "TypeError: type 'array.array' is not subscriptable". Detect that here
+    so enforce_eager (which disables CUDA graph capture) is only forced on
+    environments that actually hit it."""
+    try:
+        import flashinfer.comm  # noqa: F401
+        return False
+    except Exception:
+        return True
+
+
+_ENFORCE_EAGER = _flashinfer_comm_broken()
+
+# Datasets are pre-downloaded to local disk (compute nodes on this cluster
+# have unreliable/slow access to the HF Hub for dataset downloads) via
+# `datasets.Dataset.save_to_disk`. Loaders read from here with
+# `datasets.load_from_disk` instead of hitting the Hub.
+LOCAL_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+LOCAL_DATASET_PATH = {
+    "aime": os.path.join(LOCAL_DATA_DIR, "aime_2025"),
+    "gpqa": os.path.join(LOCAL_DATA_DIR, "gpqa_diamond"),
+    "lsat": os.path.join(LOCAL_DATA_DIR, "agieval_lsat_lr"),
+}
+
+
 # ---------------------------------------------------------------------------
 # Dataset loading. Each loader reshapes its source into the common schema:
 #   instruction: str        -- the fully-formed question to prompt the model with
@@ -54,7 +81,7 @@ LETTERS = "ABCDEFGH"
 # ---------------------------------------------------------------------------
 
 def load_aime(n: int | None, seed: int = 42) -> list[dict]:
-    ds = datasets.load_dataset("MathArena/aime_2025", split="train")
+    ds = datasets.load_from_disk(LOCAL_DATASET_PATH["aime"])
     if n is not None:
         ds = ds.shuffle(seed=seed).select(range(min(n, len(ds))))
 
@@ -73,7 +100,7 @@ def load_aime(n: int | None, seed: int = 42) -> list[dict]:
 
 
 def load_gpqa(n: int | None, seed: int = 42) -> list[dict]:
-    ds = datasets.load_dataset("Idavidrein/gpqa", "gpqa_diamond", split="train")
+    ds = datasets.load_from_disk(LOCAL_DATASET_PATH["gpqa"])
     if n is not None:
         ds = ds.shuffle(seed=seed).select(range(min(n, len(ds))))
 
@@ -109,7 +136,7 @@ def load_gpqa(n: int | None, seed: int = 42) -> list[dict]:
 
 
 def load_lsat(n: int | None, seed: int = 42) -> list[dict]:
-    ds = datasets.load_dataset("hails/agieval-lsat-lr", split="test")
+    ds = datasets.load_from_disk(LOCAL_DATASET_PATH["lsat"])
     if n is not None:
         ds = ds.shuffle(seed=seed).select(range(min(n, len(ds))))
 
@@ -200,6 +227,7 @@ def generate_responses(
         gpu_memory_utilization=0.45,
         max_model_len=32768,
         tensor_parallel_size=tensor_parallel_size,
+        enforce_eager=_ENFORCE_EAGER,
     )
 
     prompts = _build_prompts(items, tokenizer, think_budget)
