@@ -1,9 +1,9 @@
 """
 Evaluate l3lab/L1-Qwen-1.5B-Exact on math/science reasoning benchmarks
-(AIME, GPQA, LSAT) using vLLM for generation. These datasets carry their own
-gold answers, so scoring is done by extracting the model's final answer and
-exact-matching it against the dataset label -- no external evaluator model
-is needed.
+(AIME, GPQA, LSAT, MATH-500, GSM8K) using vLLM for generation. These
+datasets carry their own gold answers, so scoring is done by extracting the
+model's final answer and exact-matching it against the dataset label -- no
+external evaluator model is needed.
 
 Two-stage usage:
   # Stage 1: generate responses, save to parquet
@@ -28,18 +28,19 @@ import datasets
 import pandas as pd
 import torch
 import torch.multiprocessing as mp
-from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
 
 MODEL_ID = "l3lab/L1-Qwen-1.5B-Exact"
 
-DATASETS = ("aime", "gpqa", "lsat")
+DATASETS = ("aime", "gpqa", "lsat", "math", "gsm8k")
 
 DATASET_HF_ID = {
     "aime": "MathArena/aime_2025",
     "gpqa": "Idavidrein/gpqa (gpqa_diamond)",
     "lsat": "hails/agieval-lsat-lr",
+    "math": "HuggingFaceH4/MATH-500",
+    "gsm8k": "openai/gsm8k (main)",
 }
 
 LETTERS = "ABCDEFGH"
@@ -69,6 +70,8 @@ LOCAL_DATASET_PATH = {
     "aime": os.path.join(LOCAL_DATA_DIR, "aime_2025"),
     "gpqa": os.path.join(LOCAL_DATA_DIR, "gpqa_diamond"),
     "lsat": os.path.join(LOCAL_DATA_DIR, "agieval_lsat_lr"),
+    "math": os.path.join(LOCAL_DATA_DIR, "math_500"),
+    "gsm8k": os.path.join(LOCAL_DATA_DIR, "gsm8k"),
 }
 
 
@@ -159,6 +162,46 @@ def load_lsat(n: int | None, seed: int = 42) -> list[dict]:
     return items
 
 
+def load_math(n: int | None, seed: int = 42) -> list[dict]:
+    ds = datasets.load_from_disk(LOCAL_DATASET_PATH["math"])
+    if n is not None:
+        ds = ds.shuffle(seed=seed).select(range(min(n, len(ds))))
+
+    items = []
+    for ex in ds:
+        items.append({
+            "instruction": (
+                f"{ex['problem']}\n\n"
+                "Give your final answer as \\boxed{answer}."
+            ),
+            "answer": str(ex["answer"]),
+            "kind": "math_expr",
+            "choices": None,
+        })
+    return items
+
+
+def load_gsm8k(n: int | None, seed: int = 42) -> list[dict]:
+    ds = datasets.load_from_disk(LOCAL_DATASET_PATH["gsm8k"])
+    if n is not None:
+        ds = ds.shuffle(seed=seed).select(range(min(n, len(ds))))
+
+    items = []
+    for ex in ds:
+        # GSM8K's gold solution ends with "#### <answer>".
+        gold = ex["answer"].rsplit("####", 1)[-1].strip().replace(",", "")
+        items.append({
+            "instruction": (
+                f"{ex['question']}\n\n"
+                "Give your final answer as a single integer, written as \\boxed{answer}."
+            ),
+            "answer": str(int(gold)),
+            "kind": "numeric",
+            "choices": None,
+        })
+    return items
+
+
 def load_dataset(name: str, n: int | None, seed: int = 42) -> list[dict]:
     if name == "aime":
         return load_aime(n, seed=seed)
@@ -166,6 +209,10 @@ def load_dataset(name: str, n: int | None, seed: int = 42) -> list[dict]:
         return load_gpqa(n, seed=seed)
     elif name == "lsat":
         return load_lsat(n, seed=seed)
+    elif name == "math":
+        return load_math(n, seed=seed)
+    elif name == "gsm8k":
+        return load_gsm8k(n, seed=seed)
     raise ValueError(f"Unknown dataset: {name!r}. Choose from {DATASETS}")
 
 
@@ -190,12 +237,14 @@ def _build_prompts(items: list[dict], tokenizer, think_budget: int | None) -> li
     return prompts
 
 
-def _think_token_counts(outputs, tokenizer) -> list[int]:
-    # Count only the tokens inside <think>…</think>. If the block is unclosed
-    # (truncated by max_tokens), every generated token was a thinking token.
+def _think_token_counts(decoded: list[tuple[str, int]], tokenizer) -> list[int]:
+    """decoded: list of (full_generated_text, total_token_count) pairs --
+    backend-agnostic so both the vLLM path here and the HF-transformers
+    FlatQuant path (eval_skill_flatquant.py) can share this logic. Count
+    only the tokens inside <think>...</think>. If the block is unclosed
+    (truncated by max_tokens), every generated token was a thinking token."""
     think_token_counts = []
-    for out in outputs:
-        full_text = out.outputs[0].text
+    for full_text, total_tokens in decoded:
         think_end = full_text.find("</think>")
         if think_end != -1:
             think_ids = tokenizer.encode(
@@ -204,7 +253,7 @@ def _think_token_counts(outputs, tokenizer) -> list[int]:
             )
             think_token_counts.append(len(think_ids))
         else:
-            think_token_counts.append(len(out.outputs[0].token_ids))
+            think_token_counts.append(total_tokens)
     return think_token_counts
 
 
@@ -217,6 +266,8 @@ def generate_responses(
     think_budget: int | None = None,
     tensor_parallel_size: int = 4,
 ) -> tuple[list[str], list[str], list[int], list[int]]:
+    from vllm import LLM, SamplingParams
+
     print(f"\nLoading {model_id} with vLLM (tensor_parallel_size={tensor_parallel_size})...")
     if think_budget is not None:
         print(f"Token budget: {think_budget} tokens")
@@ -243,7 +294,9 @@ def generate_responses(
     outputs = llm.generate(prompts, sampling_params=sampling_params)
     responses = [out.outputs[0].text.strip() for out in outputs]
     token_counts = [len(out.outputs[0].token_ids) for out in outputs]
-    think_token_counts = _think_token_counts(outputs, tokenizer)
+    think_token_counts = _think_token_counts(
+        [(out.outputs[0].text, len(out.outputs[0].token_ids)) for out in outputs], tokenizer
+    )
 
     del llm
     gc.collect()
@@ -405,6 +458,21 @@ _LETTER_RE = re.compile(r"\b([A-H])\b")
 _INT_RE = re.compile(r"-?\d+")
 
 
+def _normalize_math_expr(s: str) -> str:
+    # Lightweight normalization for MATH-500's free-form gold answers
+    # (e.g. "\\frac{1}{2}", "3\\sqrt{2}") -- exact string match after
+    # stripping formatting that doesn't change the expression's meaning,
+    # not full symbolic equivalence (this repo scores without an external
+    # evaluator model or a CAS, matching every other dataset here).
+    s = s.strip()
+    s = s.replace("\\!", "").replace("\\,", "").replace("\\ ", "")
+    s = s.replace("\\left", "").replace("\\right", "")
+    s = s.replace(" ", "")
+    s = s.rstrip(".")
+    s = s.strip("$")
+    return s
+
+
 def _extract_raw_answer(response: str) -> str | None:
     """Pull the candidate final-answer substring out of free-form model text,
     preferring an explicit \\boxed{...} then a 'final answer is ...' phrase."""
@@ -441,6 +509,9 @@ def score_response(item: dict, response: str) -> dict:
                 correct = parsed == item["answer"]
             else:
                 parse_error = True
+        elif item["kind"] == "math_expr":
+            parsed = _normalize_math_expr(raw)
+            correct = parsed == _normalize_math_expr(item["answer"])
 
     return {
         "raw_extracted": raw,
@@ -525,8 +596,10 @@ def main():
 
     parser.add_argument("--dataset", type=str, default="aime", choices=DATASETS,
                         help="Dataset to evaluate on: 'aime' (MathArena/aime_2025), "
-                             "'gpqa' (Idavidrein/gpqa, gpqa_diamond), or "
-                             "'lsat' (hails/agieval-lsat-lr). Ignored with --evaluate "
+                             "'gpqa' (Idavidrein/gpqa, gpqa_diamond), "
+                             "'lsat' (hails/agieval-lsat-lr), "
+                             "'math' (HuggingFaceH4/MATH-500), or "
+                             "'gsm8k' (openai/gsm8k, main). Ignored with --evaluate "
                              "(read from parquet).")
     parser.add_argument("--parquet", type=str, default=None,
                         help="Parquet file to save/load generations")

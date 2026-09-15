@@ -7,3 +7,5 @@ __pycache__/
 *.parquet
 checkpoints/
 *.log
+quantize/flatquant/
+data/

@@ -1,13 +1,15 @@
 """
 Compare a base model against its post-training-quantized variants
-(BF16, int8, int4, int3 weight-only GPTQ; W8A8, W4A8 weight-activation)
-on UWNSL/SafeChain or allenai/wildguardmix, evaluated with WildGuard.
+(BF16, int8, int4, int3 weight-only GPTQ; W8A8, W4A8 weight-activation;
+AWQ weight-only) on UWNSL/SafeChain or allenai/wildguardmix, evaluated with
+WildGuard.
 
 Quantized checkpoints can either already exist (see ../quantize/quantize_model.py
-for int8/int4/int3, ../quantize/quantize_model_activation.py for W8A8/W4A8 --
-pass them via --int8-model-id etc.), or be produced by this script itself via
---quantize, which saves the resulting checkpoints to --out-dir/checkpoints
-before generation/evaluation runs.
+for int8/int4/int3, ../quantize/quantize_model_activation.py for W8A8/W4A8,
+../quantize/quantize_model_awq.py for AWQ -- pass them via --int8-model-id
+etc.), or be produced by this script itself via --quantize, which saves the
+resulting checkpoints to --out-dir/checkpoints before generation/evaluation
+runs.
 
 Usage (pre-built checkpoints):
     python sweep_quantization.py \
@@ -17,12 +19,13 @@ Usage (pre-built checkpoints):
         --int3-model-id ./checkpoints/L1-Qwen-1.5B-Exact-gptq-int3 \
         --w8a8-model-id ./checkpoints/L1-Qwen-1.5B-Exact-w8a8 \
         --w4a8-model-id ./checkpoints/L1-Qwen-1.5B-Exact-w4a8 \
+        --awq-model-id ./checkpoints/L1-Qwen-1.5B-Exact-awq-w4a16_asym \
         --dataset safechain --n 500
 
 Usage (quantize then evaluate in one go):
     python sweep_quantization.py \
         --bf16-model-id l3lab/L1-Qwen-1.5B-Exact \
-        --quantize int8 int4 int3 w8a8 w4a8 \
+        --quantize int8 int4 int3 w8a8 w4a8 awq \
         --dataset safechain --n 500
 """
 import argparse
@@ -34,15 +37,20 @@ from datetime import datetime
 
 import pandas as pd
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "utils"))
+from dataset_utils import DATASETS  # noqa: E402
+
 
 SCRIPT = os.path.join(os.path.dirname(__file__), "eval_safety.py")
 QUANTIZE_GPTQ_SCRIPT = os.path.join(os.path.dirname(__file__), "..", "quantize", "quantize_model.py")
 QUANTIZE_ACT_SCRIPT = os.path.join(os.path.dirname(__file__), "..", "quantize", "quantize_model_activation.py")
+QUANTIZE_AWQ_SCRIPT = os.path.join(os.path.dirname(__file__), "..", "quantize", "quantize_model_awq.py")
 
-PRECISIONS = ("bf16", "int8", "int4", "int3", "w8a8", "w4a8")
-QUANTIZABLE_PRECISIONS = ("int8", "int4", "int3", "w8a8", "w4a8")
+PRECISIONS = ("bf16", "int8", "int4", "int3", "w8a8", "w4a8", "awq")
+QUANTIZABLE_PRECISIONS = ("int8", "int4", "int3", "w8a8", "w4a8", "awq")
 GPTQ_BITS = {"int8": 8, "int4": 4, "int3": 3}
 ACTIVATION_SCHEMES = {"w8a8": "W8A8", "w4a8": "W4A8"}
+AWQ_SCHEMES = {"awq": "W4A16_ASYM"}
 
 
 def run(cmd: list[str], label: str):
@@ -71,6 +79,14 @@ def quantize_stage(precisions: list[str], bf16_model_id: str, calib_dataset: str
             cmd = [QUANTIZE_GPTQ_SCRIPT,
                    "--model-id", bf16_model_id,
                    "--bits", str(GPTQ_BITS[precision]),
+                   "--calib-dataset", calib_dataset,
+                   "--calib-samples", str(calib_samples),
+                   "--seed", str(seed),
+                   "--output-dir", output_dir]
+        elif precision in AWQ_SCHEMES:
+            cmd = [QUANTIZE_AWQ_SCRIPT,
+                   "--model-id", bf16_model_id,
+                   "--scheme", AWQ_SCHEMES[precision],
                    "--calib-dataset", calib_dataset,
                    "--calib-samples", str(calib_samples),
                    "--seed", str(seed),
@@ -175,7 +191,7 @@ def summarize(result_files: list[tuple[str, str]], out_dir: str) -> pd.DataFrame
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare BF16/int8/int4/int3/W8A8/W4A8 checkpoints on safety evals")
+        description="Compare BF16/int8/int4/int3/W8A8/W4A8/AWQ checkpoints on safety evals")
     parser.add_argument("--dataset", type=str, default="safechain", choices=("safechain", "wildguard"))
     parser.add_argument("--bf16-model-id", type=str, default=None,
                         help="Base BF16 model ID or path (unquantized)")
@@ -189,6 +205,8 @@ def main():
                         help="Path to the W8A8 (weight-activation) checkpoint")
     parser.add_argument("--w4a8-model-id", type=str, default=None,
                         help="Path to the W4A8 (weight-activation) checkpoint")
+    parser.add_argument("--awq-model-id", type=str, default=None,
+                        help="Path to the AWQ (weight-only) checkpoint")
     parser.add_argument("--quantize", type=str, default=None, nargs="+",
                         choices=QUANTIZABLE_PRECISIONS,
                         help="Quantize --bf16-model-id to these precisions and save the "
@@ -220,11 +238,12 @@ def main():
         "int3": args.int3_model_id,
         "w8a8": args.w8a8_model_id,
         "w4a8": args.w4a8_model_id,
+        "awq": args.awq_model_id,
     }
     model_ids = {k: v for k, v in model_ids.items() if v is not None}
     if not model_ids and not args.quantize:
         print("Error: provide at least one of --bf16-model-id/--int8-model-id/--int4-model-id/"
-              "--int3-model-id/--w8a8-model-id/--w4a8-model-id, or --quantize")
+              "--int3-model-id/--w8a8-model-id/--w4a8-model-id/--awq-model-id, or --quantize")
         sys.exit(1)
 
     out_dir = args.out_dir or f"quant_sweep_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
