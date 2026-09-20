@@ -131,8 +131,12 @@ def generate_responses_flatquant(
     token_counts: list[int | None] = [None] * len(prompts)
     start_idx = 0
     if checkpoint_path and os.path.exists(checkpoint_path):
-        with open(checkpoint_path) as f:
-            ckpt = json.load(f)
+        try:
+            with open(checkpoint_path) as f:
+                ckpt = json.load(f)
+        except json.JSONDecodeError:
+            print(f"Checkpoint {checkpoint_path} is corrupted (partial write), ignoring it")
+            ckpt = {}
         if ckpt.get("prompts") == prompts:
             done = len(ckpt["responses"])
             responses[:done] = ckpt["responses"]
@@ -167,12 +171,17 @@ def generate_responses_flatquant(
         done = min(i + batch_size, len(prompts))
         print(f"  {done}/{len(prompts)}")
         if checkpoint_path:
-            with open(checkpoint_path, "w") as f:
+            # Write to a temp file and rename over the real path so a kill
+            # (SIGKILL from a job/session timeout, mid-write) can never leave
+            # a truncated, unparseable checkpoint -- os.replace is atomic.
+            tmp_path = checkpoint_path + ".tmp"
+            with open(tmp_path, "w") as f:
                 json.dump({
                     "prompts": prompts,
                     "responses": responses[:done],
                     "token_counts": token_counts[:done],
                 }, f)
+            os.replace(tmp_path, checkpoint_path)
 
     if checkpoint_path and os.path.exists(checkpoint_path):
         os.remove(checkpoint_path)
