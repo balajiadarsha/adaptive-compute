@@ -1,5 +1,7 @@
 # adaptive-compute
 
+![Approach: reasoning budget and precision as two compute knobs, evaluated for skill, safety and FLOPs](plots/approach_figure.png)
+
 Studies how constraining a reasoning model's "thinking" token budget affects
 safety behavior and task skill. Reasoning models (e.g. L1-Qwen, DeepScaleR,
 DeepSeek-R1-Distill) are prompted with `Think for N tokens.` at varying
