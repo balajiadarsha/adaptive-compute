@@ -9,3 +9,11 @@ checkpoints/
 *.log
 quantize/flatquant/
 data/
+eval/results
+quantize/checkpoints
+quantize/logs
+
+*.tex
+context/
+# README figure (exception to *.png)
+!plots/approach_figure.png

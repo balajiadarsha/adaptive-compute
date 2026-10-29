@@ -1,7 +1,8 @@
 """
-Evaluate l3lab/L1-Qwen-1.5B-Exact on UWNSL/SafeChain or allenai/wildguardmix
-(WildGuardTest) using vLLM for generation and WildGuard for safety
-classification.
+Evaluate l3lab/L1-Qwen-1.5B-Exact on UWNSL/SafeChain, allenai/wildguardmix
+(WildGuardTest) or StrongREJECT using vLLM for generation and WildGuard for safety
+classification. score_safety.py is the trace/answer-split scorer used for the
+safety table; --evaluate here still judges the whole response.
 
 Two-stage usage:
   # Stage 1: generate responses, save to parquet
@@ -24,20 +25,28 @@ from datetime import datetime
 import pandas as pd
 import torch
 import torch.multiprocessing as mp
-from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
-#sys.path.insert(0, os.path.join(os.path.dirname(__file__), "wildguard"))
-from wildguard import load_wildguard
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "utils"))
-from dataset_utils import DATASETS, DATASET_HF_ID, load_dataset, load_safechain, load_wildguardmix  # noqa: E402
+from dataset_utils import DATASETS, DATASET_HF_ID, SAFECHAIN_CALIB_SAMPLES, load_dataset  # noqa: E402
 
 
 MODEL_ID = "l3lab/L1-Qwen-1.5B-Exact"
 
 HARMFUL_LABELS = {"vanilla_harmful", "adversarial_harmful"}
 BENIGN_LABELS = {"vanilla_benign", "adversarial_benign"}
+
+
+def split_trace_answer(response: str) -> tuple[str, str | None]:
+    """Split a response at </think> into (reasoning trace, final answer).
+    The R1-style chat templates end the prompt with "<think>\n", so the
+    response holds the trace, then "</think>", then the answer. With no
+    </think> (cut off by max_tokens) the whole response is trace and the
+    answer is None ("no answer")."""
+    end = response.find("</think>")
+    if end == -1:
+        return response.removeprefix("<think>").strip(), None
+    return response[:end].removeprefix("<think>").strip(), response[end + len("</think>"):].strip()
 
 
 def _build_prompts(items: list[dict], tokenizer, think_budget: int | None) -> list[str]:
@@ -84,6 +93,10 @@ def generate_responses(
     think_budget: int | None = None,
     tensor_parallel_size: int = 4,
 ) -> tuple[list[str], list[str], list[int], list[int]]:
+    # Imported here so this module (save_parquet, split_trace_answer,
+    # compute_metrics) also imports in the flatquant env, which has no vLLM.
+    from vllm import LLM, SamplingParams
+
     print(f"\nLoading {model_id} with vLLM (tensor_parallel_size={tensor_parallel_size})...")
     if think_budget is not None:
         print(f"Token budget: {think_budget} tokens")
@@ -251,6 +264,8 @@ def load_parquet(path: str) -> tuple[list[dict], list[str], list[str], list[int]
 
 
 def classify_safety(items: list[dict], responses: list[str]) -> list[dict]:
+    from wildguard import load_wildguard
+
     print("\nRunning WildGuard safety classification...")
     wildguard = load_wildguard(use_vllm=True, ephemeral_model=True)
     wg_inputs = [
@@ -366,8 +381,9 @@ def main():
                       help="Only run WildGuard on an existing parquet (skip generation)")
 
     parser.add_argument("--dataset", type=str, default="safechain", choices=DATASETS,
-                        help="Dataset to evaluate on: 'safechain' (UWNSL/SafeChain) or "
-                             "'wildguard' (allenai/wildguardmix, wildguardtest split). "
+                        help="Dataset to evaluate on: 'safechain' (UWNSL/SafeChain), "
+                             "'wildguard' (allenai/wildguardmix, wildguardtest split) or "
+                             "'strongreject' (313 StrongREJECT prompts). "
                              "Ignored with --evaluate (read from parquet).")
     parser.add_argument("--parquet", type=str, default=None,
                         help="Parquet file to save/load generations")
@@ -381,6 +397,9 @@ def main():
     parser.add_argument("--output", type=str, default=None,
                         help="Output JSON file for results (default: results_<timestamp>.json)")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--safechain-offset", type=int, default=SAFECHAIN_CALIB_SAMPLES,
+                        help="Skip this many rows of the seed-shuffled SafeChain data; the "
+                             "default skips the GPTQ/AWQ calibration prompts.")
     parser.add_argument("--model-id", type=str, default=MODEL_ID,
                         help=f"HuggingFace model ID to evaluate (default: {MODEL_ID})")
     parser.add_argument("--tensor-parallel-size", type=int, default=4,
@@ -409,7 +428,7 @@ def main():
         # Stage 1: generate
         dataset = args.dataset
         print(f"Loading {DATASET_HF_ID[dataset]} dataset...")
-        items = load_dataset(dataset, args.n, seed=args.seed)
+        items = load_dataset(dataset, args.n, seed=args.seed, offset=args.safechain_offset)
         print(f"Loaded {len(items)} samples")
 
         think_budget = args.think_budget

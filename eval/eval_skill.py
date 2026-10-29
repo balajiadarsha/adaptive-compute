@@ -452,7 +452,9 @@ def load_parquet(path: str) -> tuple[list[dict], list[str], list[str], list[int]
 # own response text and exact-match it against the dataset's gold answer.
 # ---------------------------------------------------------------------------
 
-_BOXED_RE = re.compile(r"\\boxed\{([^{}]*)\}")
+_BOXED_START_RE = re.compile(r"\\boxed\s*\{")
+_TEXT_WRAP_RE = re.compile(r"\\(?:text|textbf|mathrm|mathbf)\{([^{}]*)\}")
+_FRAC_SHORT_RE = re.compile(r"\\frac(\d)(\d)")
 _FINAL_ANSWER_RE = re.compile(r"final answer is[:\s]*\**\s*([A-Za-z0-9\-\.\,\/\s]+?)\**\s*(?:[\.\n]|$)", re.IGNORECASE)
 _LETTER_RE = re.compile(r"\b([A-H])\b")
 _INT_RE = re.compile(r"-?\d+")
@@ -467,18 +469,37 @@ def _normalize_math_expr(s: str) -> str:
     s = s.strip()
     s = s.replace("\\!", "").replace("\\,", "").replace("\\ ", "")
     s = s.replace("\\left", "").replace("\\right", "")
+    s = s.replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac")
+    s = _TEXT_WRAP_RE.sub(r"\1", s)
     s = s.replace(" ", "")
+    # "\frac59" (gold's "\frac 59" with spaces stripped) == "\frac{5}{9}"
+    s = _FRAC_SHORT_RE.sub(r"\\frac{\1}{\2}", s)
     s = s.rstrip(".")
     s = s.strip("$")
     return s
 
 
+def _boxed_contents(response: str) -> list[str]:
+    # Brace-balanced scan rather than a regex: boxed answers routinely nest
+    # braces (\boxed{\dfrac{5}{9}}, \boxed{\text{B}}), which a [^{}]* regex
+    # silently drops as parse errors.
+    out = []
+    for m in _BOXED_START_RE.finditer(response):
+        depth, i = 1, m.end()
+        while i < len(response) and depth:
+            depth += {"{": 1, "}": -1}.get(response[i], 0)
+            i += 1
+        if depth == 0:
+            out.append(response[m.end():i - 1])
+    return out
+
+
 def _extract_raw_answer(response: str) -> str | None:
     """Pull the candidate final-answer substring out of free-form model text,
     preferring an explicit \\boxed{...} then a 'final answer is ...' phrase."""
-    matches = _BOXED_RE.findall(response)
+    matches = _boxed_contents(response)
     if matches:
-        return matches[-1].strip()
+        return _TEXT_WRAP_RE.sub(r"\1", matches[-1]).strip()
     match = _FINAL_ANSWER_RE.search(response)
     if match:
         return match.group(1).strip()

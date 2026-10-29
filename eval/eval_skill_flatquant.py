@@ -1,6 +1,6 @@
 """
-Evaluate a FlatQuant-quantized (W8A8KV8 / W4A4KV4) deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-on the same skill benchmarks as eval_skill.py (aime, gpqa, lsat, math, gsm8k),
+Evaluate a FlatQuant-quantized (W8A8KV8 / W4A4KV4) Qwen2-architecture model
+(DeepSeek-R1-Distill-Qwen-1.5B by default; L1-Qwen-1.5B/7B-Exact too) on the same skill benchmarks as eval_skill.py (aime, gpqa, lsat, math, gsm8k),
 producing the identical results.json / parquet schema so it can be
 aggregated by run_skill_sweep.py alongside the vLLM-based precisions.
 
@@ -54,13 +54,13 @@ FLATQUANT_PRESETS = {
     "w4a4kv4": {"w_bits": 4, "a_bits": 4, "k_bits": 4, "v_bits": 4},
 }
 
-DEFAULT_MATRIX_DIR = {
-    scheme: os.path.join(
-        FLATQUANT_DIR, "outputs", "DeepSeek-R1-Distill-Qwen-1.5B",
-        "w8a8" if scheme == "w8a8kv8" else "w4a4", "exp",
+def default_matrix_dir(model_id: str, scheme: str) -> str:
+    # Mirrors main.py's exp_dir layout: outputs/<model basename>/w{w}a{a}/exp
+    bits = FLATQUANT_PRESETS[scheme]
+    return os.path.join(
+        FLATQUANT_DIR, "outputs", model_id.rstrip("/").split("/")[-1],
+        f"w{bits['w_bits']}a{bits['a_bits']}", "exp",
     )
-    for scheme in SCHEMES
-}
 
 
 def _build_flatquant_args(scheme: str, model_id: str, matrix_path: str, seed: int) -> argparse.Namespace:
@@ -120,7 +120,7 @@ def generate_responses_flatquant(
     (prompts + responses/token_counts completed so far) rewritten after each
     batch; a restarted run with the same checkpoint_path skips straight to
     the first unfinished batch instead of regenerating from scratch."""
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
@@ -203,7 +203,7 @@ def main():
     parser.add_argument("--model-id", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
     parser.add_argument("--matrix-path", type=str, default=None,
                         help="Directory containing flat_matrices.pth (default: the vendored "
-                             "FlatQuant repo's outputs dir for this scheme)")
+                             "FlatQuant repo's outputs/<model>/w{w}a{a}/exp for this model and scheme)")
     parser.add_argument("--parquet", type=str, default=None)
     parser.add_argument("--n", type=int, default=None)
     parser.add_argument("--max-tokens", type=int, default=4096)
@@ -216,7 +216,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    matrix_path = args.matrix_path or DEFAULT_MATRIX_DIR[args.scheme]
+    matrix_path = args.matrix_path or default_matrix_dir(args.model_id, args.scheme)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     parquet_path = args.parquet or f"generations_flatquant_{args.scheme}_{timestamp}.parquet"
