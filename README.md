@@ -23,41 +23,116 @@ Separately, the repo also studies how **post-training quantization**
 the same safety/skill metrics, to see whether compute savings from budget
 constraints and from quantization compose.
 
-## Layout
+## Features
 
-- `eval/eval_safety.py` — two-stage generate/evaluate script for the safety
-  benchmarks (SafeChain / WildGuardMix). Generates responses with vLLM and
-  saves them to a parquet file, then (separately) runs WildGuard
-  classification and computes safety metrics.
-- `eval/eval_skill.py` — two-stage generate/evaluate script for the skill
-  benchmarks (AIME, GPQA, LSAT). Same parquet-based two-stage flow as
-  `eval_safety.py`, but scores against each dataset's own gold answer
-  instead of calling WildGuard.
-- `eval/sweep_budget.py` — runs `eval_safety.py` across a list of token
-  budgets, aggregates results into an Excel summary and a plot.
-- `eval/sweep_quantization.py` — compares a base (BF16) model against its
-  quantized variants (int8/int4/int3 GPTQ, W8A8/W4A8) on a safety dataset,
-  either against pre-built checkpoints or by quantizing them itself via
-  `--quantize`.
-- `utils/dataset_utils.py` — shared SafeChain / WildGuardMix loaders used by
-  both `eval/eval_safety.py` and the `quantize/` calibration-data scripts.
-- `quantize/quantize_model.py` — post-training GPTQ weight-only quantization
-  (int8/int4/int3) of a base checkpoint via `gptqmodel`, calibrated on
-  SafeChain/WildGuardMix prompts. Produces a checkpoint `eval_safety.py` /
-  `eval_skill.py` can load directly via `--model-id` (vLLM auto-detects
-  GPTQ from `quantize_config.json`).
-- `quantize/quantize_model_activation.py` — post-training weight-activation
-  quantization (W8A8, W4A8) via `llmcompressor`, producing a
-  compressed-tensors checkpoint vLLM loads natively (no extra flags).
-- `quantize/KNOWN_ISSUES.md` — write-up of a `gptqmodel` GPTQ quantization
-  failure on Intel XPU (Aurora); GPTQ int8/int4/int3 is CUDA-only for now,
-  W8A8/W4A8 via `llmcompressor` is the untested fallback path there.
-- `plots/` — standalone plotting/report scripts.
-- `scripts/jobs/` — PBS (`qsub`) job scripts for running sweeps on the ALCF
-  Polaris (CUDA) cluster; `*_aurora.sh` variants target the ALCF Aurora
-  (Intel XPU) cluster.
-- `scripts/install_xpu_env.sh`, `scripts/eval_xpu_model.sh` — environment
-  setup and eval entrypoint for the Aurora/XPU path.
+Each feature is one compute knob. Both feed the same reporting steps
+([Reporting](#reporting-tables-and-compute-plots)), so every configuration
+gets skill, safety and compute (FLOPs) numbers measured on the same
+responses. The job scripts in `scripts/jobs/` `cd` into this checkout on
+Perlmutter and use the `reason` (vLLM) and `flatquant` conda envs. Change
+those paths if you run elsewhere.
+
+### Length control (reasoning budget)
+
+Appends `Think for N tokens.` to every prompt (`--think-budget N`). Leaving
+the flag out runs the model with no budget prompt ("No limit"). Each response
+records `token_count` and `think_token_count`, so cost always pairs with the
+metric.
+
+| Step | Run | Writes |
+|---|---|---|
+| 1. Skill (generate + score) | `scripts/jobs/run_skill_grid.sh` → `eval/eval_skill.py` | `eval/results/<dir>/<model>-budget<N>/<dataset>.json` |
+| 2. Safety generation | `scripts/jobs/run_safety_grid.sh` → `eval/eval_safety.py --generate` | `.../<model>-budget<N>/{safechain,wildguard,strongreject}.parquet` |
+| 3. Safety scoring | `eval/score_safety.py` (WildGuard + StrongREJECT judges) | a `.json` next to each parquet |
+| 4. Tables, plots | see [Reporting](#reporting-tables-and-compute-plots) | `context/` |
+
+```bash
+# 1. Skill: AIME/GPQA/MATH/GSM8K at four budgets, sampled (T=0.6, top-p 0.95).
+#    CAP_MODE "default" = per-dataset caps; "32k" + "none" = the No-limit run.
+TEMPERATURE=0.6 TOP_P=0.95 bash scripts/jobs/run_skill_grid.sh \
+    l3lab/L1-Qwen-1.5B-Exact L1-Qwen-1.5B-Exact 0 results/full_eval_t06 default 512 1024 2048 4096
+TEMPERATURE=0.6 TOP_P=0.95 bash scripts/jobs/run_skill_grid.sh \
+    l3lab/L1-Qwen-1.5B-Exact L1-Qwen-1.5B-Exact 0 results/full_eval_32k_t06 32k none
+
+# 2. Safety generation (8192-token cap; "32k none" for No limit).
+bash scripts/jobs/run_safety_grid.sh \
+    l3lab/L1-Qwen-1.5B-Exact L1-Qwen-1.5B-Exact results/safety_t06 default 512 1024 2048 4096
+
+# 3. Score every parquet in one process (skips ones already scored).
+cd eval && python score_safety.py results/safety_t06/L1-Qwen-1.5B-Exact-budget*/*.parquet
+```
+
+On Slurm, `scripts/jobs/submit_safety_grid.sh` submits the whole safety
+grid. It runs one generation job per model group and chains a scoring job
+after each. All steps resume: rerunning skips finished outputs.
+
+### Quantization
+
+Post-training quantization of the same models, evaluated through the same
+grids. GPTQ and AWQ produce checkpoints that vLLM loads directly. FlatQuant
+produces learned transform matrices, which its own HF-`generate` evaluators
+apply (slower; run in the `flatquant` env).
+
+| Method | Precision | Quantize with | Evaluate with |
+|---|---|---|---|
+| GPTQ | INT8 / INT4 / INT3 weights | `quantize/quantize_model.py` | `run_skill_grid.sh`, `run_safety_grid.sh` (checkpoint as model) |
+| AWQ | W4A16 weights | `quantize/quantize_model_awq.py` | same as GPTQ |
+| FlatQuant | W8A8KV8, W4A4KV4 (weights, activations, KV cache) | `scripts/jobs/flatquant_calibrate.sh` | `scripts/jobs/run_flatquant_grid.sh` → `eval/eval_skill_flatquant.py`; `scripts/jobs/run_flatquant_safety.sh` → `eval/eval_safety_flatquant.py` |
+| W8A8 / W4A8 (legacy) | weights + activations | `quantize/quantize_model_activation.py` | `eval/sweep_quantization.py` |
+
+```bash
+# 1. Quantize (calibrated on SafeChain prompts disjoint from the eval split).
+cd quantize
+python quantize_model.py --model-id l3lab/L1-Qwen-1.5B-Exact --bits 4 \
+    --calib-dataset safechain --calib-samples 256 \
+    --output-dir ./checkpoints/L1-Qwen-1.5B-Exact-gptq-int4
+python quantize_model_awq.py --model-id l3lab/L1-Qwen-1.5B-Exact --scheme W4A16_ASYM \
+    --output-dir ./checkpoints/L1-Qwen-1.5B-Exact-awq-w4a16_asym
+bash ../scripts/jobs/flatquant_calibrate.sh l3lab/L1-Qwen-1.5B-Exact   # W8A8KV8 + W4A4KV4 matrices
+cd ..
+
+# 2. Evaluate GPTQ/AWQ: pass the checkpoint as the model (combines with any budget).
+bash scripts/jobs/run_skill_grid.sh ../quantize/checkpoints/L1-Qwen-1.5B-Exact-gptq-int4 \
+    L1-Qwen-1.5B-Exact-gptq-int4 0 results/full_eval default 512 1024 2048 4096
+bash scripts/jobs/run_safety_grid.sh ../quantize/checkpoints/L1-Qwen-1.5B-Exact-gptq-int4 \
+    L1-Qwen-1.5B-Exact-gptq-int4 results/safety_t06 default 512 1024 2048 4096
+
+#    Evaluate FlatQuant: <model> <scheme> <budget> <out dir> <batch size>.
+TEMPERATURE=0.6 TOP_P=0.95 bash scripts/jobs/run_flatquant_grid.sh \
+    l3lab/L1-Qwen-1.5B-Exact w4a4kv4 1024 results/full_eval_t06 16
+bash scripts/jobs/run_flatquant_safety.sh l3lab/L1-Qwen-1.5B-Exact w4a4kv4 1024 results/safety_t06 16
+
+# 3. Score safety as for length control, then build the tables and plots.
+cd eval && python score_safety.py results/safety_t06/L1-Qwen-1.5B-Exact-*-budget*/*.parquet
+```
+
+GPTQ only runs on CUDA (see `quantize/KNOWN_ISSUES.md` for the Aurora/XPU
+failure). The FlatQuant evaluators checkpoint every batch and resume a
+half-finished dataset.
+
+### Reporting: tables and compute plots
+
+Run from `eval/` once results exist. Missing runs show as `--` or are left
+out, so these also work as status reports while jobs are still running.
+Outputs go to `context/`, which git ignores.
+
+| Script | Produces |
+|---|---|
+| `make_budget_table.py` | skill Acc / Len table per model, budget and precision (`.md`, `.tex`) |
+| `make_safety_table.py` | safety tables (ASR, FRR, StrongREJECT; answer / trace) for length control and quantization |
+| `plot_acc_vs_flops.py` | accuracy vs mean FLOPs per problem, per dataset + average |
+| `plot_safety_vs_flops.py` | ASR, FRR and StrongREJECT vs mean FLOPs |
+| `make_plot_data_xlsx.py` | `plot_data.xlsx` with every plotted point (run after the two plot scripts) |
+
+FLOPs come from `utils/flops.py`, an analytical, precision-independent count
+of prefill, decode, lm_head and attention operations. Quantization therefore
+changes compute only through the number of tokens a model generates.
+
+```bash
+cd eval
+python make_budget_table.py && python make_safety_table.py
+python plot_acc_vs_flops.py && python plot_safety_vs_flops.py && python make_plot_data_xlsx.py
+```
 
 ## Setup
 
